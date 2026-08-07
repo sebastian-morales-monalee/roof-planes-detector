@@ -1,0 +1,11 @@
+numpy==2.4.4
+opencv-python-headless==4.13.0.92
+pillow==12.3.0
+scikit-image>=0.25,<1
+scikit-learn>=1.7,<2
+transformers==5.12.1
+lang-sam @ git+https://github.com/luca-medeiros/lang-segment-anything.git@918043ed4666eea04da88aa179eb8d27ef4b1a1d
+openai==2.50.0
+python-dotenv==1.2.2
+httpx>=0.28,<1
+rasterio>=1.4,<2

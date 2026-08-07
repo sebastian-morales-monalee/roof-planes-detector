@@ -1,0 +1,28 @@
+.venv/
+.cache/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editor, operating-system, and WSL metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# Generated segmentation artifacts
+start_output/*
+!start_output/.gitkeep
+outputs/*
+!outputs/.gitkeep
