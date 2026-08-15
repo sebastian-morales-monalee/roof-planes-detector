@@ -26,3 +26,8 @@ start_output/*
 !start_output/.gitkeep
 outputs/*
 !outputs/.gitkeep
+
+# GLB processing: keep source scripts and input fixtures, exclude generated data
+scripts_glb/.vendor/
+scripts_glb/outputs_glb/
+scripts_glb/work/analysis*/
