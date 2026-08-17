@@ -147,6 +147,12 @@ Cada ejecución crea una nueva subcarpeta de fecha y hora con estos archivos:
 - `previews/comparison_simplified_vs_regularized.png`: simplificado a la izquierda
   y regularizado a la derecha.
 - `previews/comparison_all_geometries.png`: exacto, simplificado y regularizado.
+- `roof_planes_regularized_rotations.json`: coordenadas, normales, centroides,
+  ecuaciones, matrices y límites de las rotaciones solicitadas.
+- `rotations/roof_planes_regularized_rotated_<rotación>.glb`: una copia con
+  geometría aplicada por cada rotación solicitada.
+- `rotations/previews/<rotación>.png` y `rotations/previews/comparison.png`:
+  validaciones visuales de las orientaciones generadas.
 - `roof_planes_report.md`: resumen legible de áreas, pendientes y confianza.
 - `manifest.json`: entrada, parámetros, hashes y archivos producidos.
 
@@ -199,11 +205,14 @@ Parámetros principales:
 - `--regularization-min-iou 0.95`: coincidencia superficial mínima con el contorno
   simplificado.
 - `--regularization-max-area-change 0.05`: limita el cambio de área al 5%.
+- `--regularized-rotations none`: no genera copias rotadas de forma predeterminada.
+  Admite `all`, `x_positive_90`, `x_negative_90`, `y_positive_90`,
+  `y_negative_90`, `z_positive_90` y `z_negative_90`.
 - `--min-hole-area 0.01`: elimina huecos inferiores a esta área.
 
 Estas distancias y áreas utilizan las unidades originales del modelo, porque glTF no
-declara por sí mismo si una unidad equivale a metros, centímetros u otra escala. El
-Los archivos `roof_planes_exact_overlay.glb` y
+declara por sí mismo si una unidad equivale a metros, centímetros u otra escala. Los
+archivos `roof_planes_exact_overlay.glb` y
 `roof_planes_simplified_overlay.glb` deben compararse visualmente cuando se procese
 un modelo nuevo, ya que las tolerancias pueden necesitar calibración.
 
@@ -222,6 +231,37 @@ La regularización del contorno es posterior a la fusión de planos. Une esquina
 dominantes mediante segmentos rectos, pero solo acepta el cambio cuando reduce
 vértices, mantiene el IoU configurado y respeta el límite de cambio de área. El
 JSON conserva en paralelo `simplified_roof_planes` y `regularized_roof_planes`.
+
+### Rotaciones del resultado regularizado
+
+Generar las seis rotaciones de 90 grados:
+
+```bash
+python3 detect_roof_planes.py \
+  input_glbs/roof_model_cut_x_keep_negative.glb \
+  --regularized-rotations all
+```
+
+Generar una o varias orientaciones específicas:
+
+```bash
+python3 detect_roof_planes.py \
+  input_glbs/roof_model_cut_x_keep_negative.glb \
+  --regularized-rotations x_positive_90 z_negative_90
+```
+
+Las rotaciones siguen la regla de la mano derecha sobre los ejes glTF y se aplican
+alrededor del centro de la caja envolvente del conjunto regularizado. Son cambios
+reales de geometría: el GLB no depende de rotaciones de nodo. El JSON recalcula para
+cada plano sus vértices, contornos, centroide, normal, ecuación y pendiente. El área,
+los identificadores y la conectividad de los triángulos se conservan.
+
+La hoja de seis resultados se ordena así:
+
+```text
+x_positive_90 | x_negative_90 | y_positive_90
+y_negative_90 | z_positive_90 | z_negative_90
+```
 
 Los valores admitidos por `--roof-up` y `--view-from` son `positive_x`,
 `negative_x`, `positive_y`, `negative_y`, `positive_z` y `negative_z`. Las

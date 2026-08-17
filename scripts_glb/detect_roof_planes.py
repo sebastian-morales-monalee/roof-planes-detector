@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -71,6 +72,14 @@ VIEW_FROM_GLTF = {
     "positive_z": (0.0, 0.0, 1.0),
     "negative_z": (0.0, 0.0, -1.0),
 }
+REGULARIZED_ROTATIONS = (
+    "x_positive_90",
+    "x_negative_90",
+    "y_positive_90",
+    "y_negative_90",
+    "z_positive_90",
+    "z_negative_90",
+)
 
 
 class UnionFind:
@@ -329,6 +338,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cambio relativo máximo de área permitido al regularizar.",
     )
     parser.add_argument(
+        "--regularized-rotations",
+        nargs="+",
+        choices=("none", "all", *REGULARIZED_ROTATIONS),
+        default=["none"],
+        help=(
+            "Genera copias rígidas de regularized-only rotadas 90 grados en "
+            "ejes glTF; usa all para las seis o indica una o varias rotaciones."
+        ),
+    )
+    parser.add_argument(
         "--min-hole-area",
         type=float,
         default=0.01,
@@ -376,6 +395,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--regularization-max-area-change debe estar entre 0 y 1."
         )
+    if "none" in args.regularized_rotations and len(args.regularized_rotations) != 1:
+        raise ValueError("'none' no se puede combinar con otras rotaciones.")
+    if "all" in args.regularized_rotations and len(args.regularized_rotations) != 1:
+        raise ValueError("'all' no se puede combinar con otras rotaciones.")
+    if args.regularized_rotations != ["none"] and args.geometry_output == "exact":
+        raise ValueError(
+            "Las rotaciones regularizadas requieren --geometry-output simplified o both."
+        )
     if min(
         args.merge_plane_distance,
         args.merge_max_residual,
@@ -391,6 +418,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("'all' no se puede combinar con otros valores de --roof-ups.")
     if args.views and args.roof_ups:
         raise ValueError("--views y --roof-ups son modalidades diferentes y no se combinan.")
+    if args.regularized_rotations != ["none"] and (args.views or args.roof_ups):
+        raise ValueError(
+            "--regularized-rotations solo se admite en la detección principal, "
+            "sin --views ni --roof-ups."
+        )
     if args.views and args.visible_part != "full-plane":
         raise ValueError("Las ejecuciones multivista requieren --visible-part full-plane.")
 
@@ -409,6 +441,14 @@ def resolved_roof_ups(args: argparse.Namespace) -> tuple[str, ...]:
     if args.roof_ups == ["all"]:
         return tuple(VIEW_FROM_GLTF)
     return tuple(dict.fromkeys(args.roof_ups))
+
+
+def resolved_regularized_rotations(args: argparse.Namespace) -> tuple[str, ...]:
+    if args.regularized_rotations == ["none"]:
+        return ()
+    if args.regularized_rotations == ["all"]:
+        return REGULARIZED_ROTATIONS
+    return tuple(dict.fromkeys(args.regularized_rotations))
 
 
 def resolve_input(value: str) -> Path:
@@ -499,6 +539,160 @@ def clean_number(value: float) -> float:
 
 def clean_vector(values: Any) -> list[float]:
     return [clean_number(value) for value in values]
+
+
+def regularized_rotation_matrix_gltf(rotation_name: str) -> Any:
+    sign = 1.0 if "_positive_" in rotation_name else -1.0
+    axis = rotation_name[0]
+    if axis == "x":
+        return np.asarray(
+            ((1.0, 0.0, 0.0), (0.0, 0.0, -sign), (0.0, sign, 0.0)),
+            dtype=np.float64,
+        )
+    if axis == "y":
+        return np.asarray(
+            ((0.0, 0.0, sign), (0.0, 1.0, 0.0), (-sign, 0.0, 0.0)),
+            dtype=np.float64,
+        )
+    return np.asarray(
+        ((0.0, -sign, 0.0), (sign, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        dtype=np.float64,
+    )
+
+
+def rotate_gltf_points(points: Any, matrix: Any, pivot: Any) -> Any:
+    values = np.asarray(points, dtype=np.float64)
+    return (values - pivot) @ matrix.T + pivot
+
+
+def rotate_boundary_components(components: list[dict[str, Any]], matrix: Any, pivot: Any) -> list[dict[str, Any]]:
+    rotated = []
+    for component in components:
+        rotated.append(
+            {
+                "outer": [
+                    clean_vector(point)
+                    for point in rotate_gltf_points(component["outer"], matrix, pivot)
+                ],
+                "holes": [
+                    [
+                        clean_vector(point)
+                        for point in rotate_gltf_points(hole, matrix, pivot)
+                    ]
+                    for hole in component["holes"]
+                ],
+            }
+        )
+    return rotated
+
+
+def build_regularized_rotation_results(
+    planes: list[dict[str, Any]],
+    rotation_names: tuple[str, ...],
+    roof_up_name: str,
+) -> tuple[Any, dict[str, dict[str, Any]]]:
+    all_vertices_gltf = np.concatenate(
+        [blender_to_gltf_array(plane["regularized_vertices"]) for plane in planes]
+    )
+    pivot = (all_vertices_gltf.min(axis=0) + all_vertices_gltf.max(axis=0)) * 0.5
+    roof_up = np.asarray(VIEW_FROM_GLTF[roof_up_name], dtype=np.float64)
+    roof_up /= np.linalg.norm(roof_up)
+    results: dict[str, dict[str, Any]] = {}
+
+    for rotation_name in rotation_names:
+        matrix = regularized_rotation_matrix_gltf(rotation_name)
+        axis = rotation_name[0]
+        angle_degrees = 90.0 if "_positive_" in rotation_name else -90.0
+        translation = pivot - matrix @ pivot
+        matrix_4x4 = np.eye(4, dtype=np.float64)
+        matrix_4x4[:3, :3] = matrix
+        matrix_4x4[:3, 3] = translation
+        rotated_planes = []
+        rotated_json_planes = []
+        rotated_vertices_for_bounds = []
+
+        for plane in planes:
+            vertices_gltf = blender_to_gltf_array(plane["regularized_vertices"])
+            rotated_vertices_gltf = rotate_gltf_points(vertices_gltf, matrix, pivot)
+            rotated_vertices_blender = gltf_to_blender_array(rotated_vertices_gltf)
+            centroid_gltf = blender_to_gltf_array(plane["centroid"])
+            rotated_centroid_gltf = rotate_gltf_points(centroid_gltf, matrix, pivot)
+            normal_gltf = blender_to_gltf_array(plane["normal"])
+            normal_gltf /= np.linalg.norm(normal_gltf)
+            rotated_normal_gltf = matrix @ normal_gltf
+            rotated_normal_gltf /= np.linalg.norm(rotated_normal_gltf)
+            rotated_normal_blender = gltf_to_blender_array(rotated_normal_gltf)
+            pitch = math.degrees(
+                math.acos(
+                    max(-1.0, min(1.0, float(np.dot(rotated_normal_gltf, roof_up))))
+                )
+            )
+            plane_d = -float(np.dot(rotated_normal_gltf, rotated_centroid_gltf))
+
+            plane_json = deepcopy(plane["regularized_json"])
+            plane_json["centroid"] = clean_vector(rotated_centroid_gltf)
+            plane_json["normal"] = clean_vector(rotated_normal_gltf)
+            plane_json["pitch_degrees"] = clean_number(pitch)
+            plane_json["plane_equation"] = {
+                "a": clean_number(rotated_normal_gltf[0]),
+                "b": clean_number(rotated_normal_gltf[1]),
+                "c": clean_number(rotated_normal_gltf[2]),
+                "d": clean_number(plane_d),
+                "form": "a*x + b*y + c*z + d = 0",
+            }
+            plane_json["boundary_components"] = rotate_boundary_components(
+                plane["regularized_boundaries"], matrix, pivot
+            )
+            plane_json["mesh"] = {
+                "vertices": [clean_vector(point) for point in rotated_vertices_gltf],
+                "triangles": [list(face) for face in plane["regularized_faces"]],
+            }
+            plane_json["rotation"] = {
+                "id": rotation_name,
+                "axis_gltf": axis.upper(),
+                "angle_degrees": clean_number(angle_degrees),
+            }
+            rotated_json_planes.append(plane_json)
+            rotated_vertices_for_bounds.append(rotated_vertices_gltf)
+            rotated_planes.append(
+                {
+                    "id": plane_json["id"],
+                    "vertices": rotated_vertices_blender,
+                    "faces": plane["regularized_faces"],
+                    "normal": rotated_normal_blender,
+                    "source_plane_ids": list(plane["source_plane_ids"]),
+                    "source_simplified_plane_id": plane["id"],
+                    "area": float(plane["regularized_area"]),
+                    "pitch_degrees": pitch,
+                    "confidence": float(plane["confidence"]),
+                    "color_index": int(plane["color_index"]),
+                    "regularization_accepted": bool(
+                        plane["regularization"]["accepted"]
+                    ),
+                }
+            )
+
+        rotated_bounds = np.concatenate(rotated_vertices_for_bounds)
+        results[rotation_name] = {
+            "planes": rotated_planes,
+            "json": {
+                "id": rotation_name,
+                "axis_gltf": axis.upper(),
+                "angle_degrees": clean_number(angle_degrees),
+                "angle_convention": "right-hand rule",
+                "pivot_gltf": clean_vector(pivot),
+                "rotation_matrix_4x4_gltf": [
+                    clean_vector(row) for row in matrix_4x4
+                ],
+                "bounds_gltf": {
+                    "min": clean_vector(rotated_bounds.min(axis=0)),
+                    "max": clean_vector(rotated_bounds.max(axis=0)),
+                },
+                "roof_plane_count": len(rotated_planes),
+                "regularized_roof_planes": rotated_json_planes,
+            },
+        }
+    return pivot, results
 
 
 def import_glb(path: Path) -> None:
@@ -1513,6 +1707,31 @@ def add_regularized_plane_objects(
         )
 
 
+def add_rotated_regularized_plane_objects(
+    rotation_name: str, rotated_planes: list[dict[str, Any]]
+) -> None:
+    for plane in rotated_planes:
+        identifier = plane["id"]
+        mesh = bpy.data.meshes.new(identifier)
+        mesh.from_pydata(plane["vertices"].tolist(), [], plane["faces"])
+        mesh.update()
+        obj = bpy.data.objects.new(identifier, mesh)
+        bpy.context.scene.collection.objects.link(obj)
+        obj.data.materials.append(
+            make_material(identifier, int(plane["color_index"]))
+        )
+        obj["roof_plane_id"] = identifier
+        obj["source_simplified_plane_id"] = plane[
+            "source_simplified_plane_id"
+        ]
+        obj["source_plane_ids"] = plane["source_plane_ids"]
+        obj["area"] = plane["area"]
+        obj["pitch_degrees"] = plane["pitch_degrees"]
+        obj["confidence"] = plane["confidence"]
+        obj["regularization_accepted"] = plane["regularization_accepted"]
+        obj["rotation_id"] = rotation_name
+
+
 def add_validation_camera(
     center: Any, diagonal: float, view_from_blender: Any, view_from_name: str
 ) -> None:
@@ -1685,6 +1904,48 @@ def export_exact_and_simplified_assets(
         comparison = preview_directory / "comparison_all_geometries.png"
         create_horizontal_comparison(previews, comparison)
         assets.append((comparison, "all_geometries_preview"))
+    return assets
+
+
+def export_regularized_rotation_assets(
+    output_directory: Path,
+    pivot_gltf: Any,
+    rotation_results: dict[str, dict[str, Any]],
+    diagonal: float,
+) -> list[tuple[Path, str]]:
+    if not rotation_results:
+        return []
+    rotation_directory = output_directory / "rotations"
+    preview_directory = rotation_directory / "previews"
+    rotation_directory.mkdir()
+    preview_directory.mkdir()
+    center_blender = gltf_to_blender_array(pivot_gltf)
+    assets: list[tuple[Path, str]] = []
+    previews = []
+
+    for rotation_name, result in rotation_results.items():
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        add_rotated_regularized_plane_objects(rotation_name, result["planes"])
+        add_comparison_camera(center_blender, diagonal)
+        glb_path = rotation_directory / (
+            f"roof_planes_regularized_rotated_{rotation_name}.glb"
+        )
+        export_scene(glb_path)
+        assets.append((glb_path, f"regularized_rotation_{rotation_name}_glb"))
+
+        preview_path = preview_directory / f"{rotation_name}.png"
+        render_preview(preview_path, center_blender, diagonal)
+        previews.append(preview_path)
+        assets.append(
+            (preview_path, f"regularized_rotation_{rotation_name}_preview")
+        )
+
+    comparison_path = preview_directory / "comparison.png"
+    if len(previews) == 6:
+        create_contact_sheet(previews, comparison_path)
+    else:
+        create_horizontal_comparison(previews, comparison_path)
+    assets.append((comparison_path, "regularized_rotations_comparison"))
     return assets
 
 
@@ -2552,6 +2813,7 @@ def run(args: argparse.Namespace) -> Path:
                 "regularization_tolerance",
                 "regularization_min_iou",
                 "regularization_max_area_change",
+                "regularized_rotations",
                 "min_hole_area",
             )
         },
@@ -2683,6 +2945,37 @@ def run(args: argparse.Namespace) -> Path:
         regularized_mesh_triangles = sum(
             len(plane["regularized_faces"]) for plane in simplified
         )
+        rotation_names = resolved_regularized_rotations(args)
+        rotation_pivot_gltf = None
+        rotation_results: dict[str, dict[str, Any]] = {}
+        if simplified and rotation_names:
+            rotation_pivot_gltf, rotation_results = build_regularized_rotation_results(
+                simplified, rotation_names, args.roof_up
+            )
+        rotation_document = {
+            "schema_version": 1,
+            "description": (
+                "Rigid 90-degree rotations of the regularized roof-plane geometry."
+            ),
+            "coordinate_system": {
+                "standard": "glTF 2.0",
+                "up_axis": "Y",
+                "handedness": "right-handed",
+                "units": "source model units (not declared by glTF)",
+                "angle_convention": "right-hand rule",
+            },
+            "source_geometry": "roof_planes_regularized_only.glb",
+            "pivot_definition": "center of the regularized geometry bounding box",
+            "pivot_gltf": (
+                None
+                if rotation_pivot_gltf is None
+                else clean_vector(rotation_pivot_gltf)
+            ),
+            "rotation_count": len(rotation_results),
+            "rotations": [
+                result["json"] for result in rotation_results.values()
+            ],
+        }
         vertices_gltf = blender_to_gltf_array(vertices)
         center_gltf = (vertices_gltf.min(axis=0) + vertices_gltf.max(axis=0)) * 0.5
         camera_position_gltf = center_gltf + view_from_gltf * diagonal * 1.5
@@ -2776,6 +3069,15 @@ def run(args: argparse.Namespace) -> Path:
                         else None
                     ),
                 },
+                "regularized_rotations": {
+                    "count": len(rotation_results),
+                    "ids": list(rotation_results),
+                    "pivot_gltf": (
+                        None
+                        if rotation_pivot_gltf is None
+                        else clean_vector(rotation_pivot_gltf)
+                    ),
+                },
                 "rejected_regions": dict(rejection_counts),
                 "bounds_gltf": {
                     "min": clean_vector(vertices_gltf.min(axis=0)),
@@ -2787,12 +3089,21 @@ def run(args: argparse.Namespace) -> Path:
             "regularized_roof_planes": [
                 plane["regularized_json"] for plane in simplified
             ],
+            "regularized_rotations": rotation_document,
         }
         if not accepted:
             raise RuntimeError("No se detectaron planos con los parámetros actuales.")
 
         json_path = run_directory / "roof_planes.json"
         json_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        rotations_json_path = None
+        if rotation_results:
+            rotations_json_path = (
+                run_directory / "roof_planes_regularized_rotations.json"
+            )
+            rotations_json_path.write_text(
+                json.dumps(rotation_document, indent=2), encoding="utf-8"
+            )
         report_path = run_directory / "roof_planes_report.md"
         report_path.write_text(report_markdown(document), encoding="utf-8")
         assets = export_exact_and_simplified_assets(
@@ -2804,7 +3115,20 @@ def run(args: argparse.Namespace) -> Path:
             diagonal,
             args.geometry_output,
         )
+        if rotation_results:
+            assets.extend(
+                export_regularized_rotation_assets(
+                    run_directory,
+                    rotation_pivot_gltf,
+                    rotation_results,
+                    diagonal,
+                )
+            )
         assets.extend(((json_path, "roof_planes_json"), (report_path, "report")))
+        if rotations_json_path is not None:
+            assets.append(
+                (rotations_json_path, "regularized_rotations_json")
+            )
 
         for path, kind in assets:
             manifest["outputs"].append(
